@@ -24,7 +24,7 @@ Telegram remote control for OpenCode. Monitor sessions, send prompts, answer que
 
 ```json
 {
-  "plugin": ["opencode-tgbot"]
+  "plugin": ["github:hjzccc/opencode-tgbot"]
 }
 ```
 
