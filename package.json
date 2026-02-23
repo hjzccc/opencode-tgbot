@@ -1,0 +1,43 @@
+{
+  "name": "opencode-tgbot",
+  "version": "0.1.26",
+  "description": "Telegram remote control for OpenCode — monitor sessions, send prompts, answer questions, and manage tasks from your phone",
+  "author": "hjzccc",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hjzccc/opencode-tgbot.git"
+  },
+  "homepage": "https://github.com/hjzccc/opencode-tgbot#readme",
+  "bugs": {
+    "url": "https://github.com/hjzccc/opencode-tgbot/issues"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "prepublishOnly": "bun run build",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "telegram",
+    "remote-control",
+    "notifications"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.0.224",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  }
+}
