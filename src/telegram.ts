@@ -15,6 +15,7 @@ import {
   readSharedPendingQuestion,
   clearSharedPendingQuestion,
   writeRemoteCommand,
+  cleanupSharedState,
   upstashCommand,
   type CommandResult,
   type RemoteCommand,
@@ -1288,10 +1289,14 @@ export async function createTelegramBot(
     const handlers = buildCommandHandlers(client)
     poller = startPolling(telegramConfig, handlers, client)
 
-    const asyncCleanup = async () => { await releasePollLock() }
-    process.on("exit", () => { stopPollLockRefresh(); try { if (existsSync(LOCK_PATH)) { const pid = parseInt(readFileSync(LOCK_PATH, "utf-8").trim(), 10); if (pid === process.pid) unlinkSync(LOCK_PATH) } } catch {} })
+    const asyncCleanup = async () => { await Promise.all([releasePollLock(), cleanupSharedState()]) }
+    process.on("exit", () => { stopPollLockRefresh(); try { if (existsSync(LOCK_PATH)) { const pid = parseInt(readFileSync(LOCK_PATH, "utf-8").trim(), 10); if (pid === process.pid) unlinkSync(LOCK_PATH) } } catch {}; try { unlinkSync(join(homedir(), ".config", "opencode", "notifier", `${process.pid}.json`)) } catch {} })
     process.on("SIGINT", () => { asyncCleanup().finally(() => process.exit(0)) })
     process.on("SIGTERM", () => { asyncCleanup().finally(() => process.exit(0)) })
+  }
+ else {
+    process.on("SIGINT", () => { cleanupSharedState().finally(() => process.exit(0)) })
+    process.on("SIGTERM", () => { cleanupSharedState().finally(() => process.exit(0)) })
   }
 
   return {

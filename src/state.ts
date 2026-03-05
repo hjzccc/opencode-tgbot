@@ -144,7 +144,7 @@ function writeSharedStateNow(): void {
     void upstashCommand(
       upstashConfig.url,
       upstashConfig.token,
-      ["SET", SESSION_KEY, JSON.stringify(data), "EX", "600"]
+      ["SET", SESSION_KEY, JSON.stringify(data), "EX", "60"]
     ).catch(() => {})
   }
 }
@@ -310,12 +310,14 @@ function mergeSharedSessions(
   return Array.from(best.values())
 }
 
-export function cleanupSharedState(): void {
+export async function cleanupSharedState(): Promise<void> {
   try {
     unlinkSync(join(SHARED_STATE_DIR, `${process.pid}.json`))
   } catch {}
   if (upstashConfig) {
-    void upstashCommand(upstashConfig.url, upstashConfig.token, ["DEL", SESSION_KEY]).catch(() => {})
+    try {
+      await upstashCommand(upstashConfig.url, upstashConfig.token, ["DEL", SESSION_KEY])
+    } catch {}
   }
 }
 
