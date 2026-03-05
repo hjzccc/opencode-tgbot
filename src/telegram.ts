@@ -1,16 +1,23 @@
 import { writeFileSync, readFileSync, unlinkSync, existsSync, mkdirSync } from "fs"
 import { join } from "path"
-import { homedir } from "os"
-import type { TelegramConfig } from "./config"
+import { homedir, hostname } from "os"
+import { isUpstashConfigured, type NotifierConfig, type TelegramConfig } from "./config"
 import type { PluginInput } from "@opencode-ai/plugin"
 import {
   getBusySessions,
+  isLocalSession,
   getSession,
   readAllSharedSessions,
+  readGroupedSessions,
+  readCommandResult,
   trackTodos,
   writeSharedPendingQuestion,
   readSharedPendingQuestion,
   clearSharedPendingQuestion,
+  writeRemoteCommand,
+  upstashCommand,
+  type CommandResult,
+  type RemoteCommand,
   type TrackedSession,
 } from "./state"
 
@@ -291,6 +298,12 @@ export function notifyConnectedSessionIdle(sessionID: string): void {
 }
 
 const LOCK_PATH = join(homedir(), ".config", "opencode", "notifier-poll.lock")
+const POLL_LOCK_KEY = "poll:lock"
+const POLL_LOCK_TTL_SECONDS = 30
+const POLL_LOCK_REFRESH_MS = 15_000
+const INSTANCE_IDENTITY = `${hostname()}:${process.pid}`
+let upstashLockConfig: { url: string; token: string } | null = null
+let pollLockRefreshInterval: ReturnType<typeof setInterval> | null = null
 
 export async function forwardQuestionToTelegram(question: PendingQuestion): Promise<void> {
   if (!storedBotToken || !storedChatId) return
@@ -357,8 +370,39 @@ async function fetchPendingQuestionsInternal(sessionID: string | null): Promise<
   }
 }
 
-async function handleQuestionReply(text: string): Promise<string> {
-  if (!pendingQuestion || !storedClient) {
+function createCommandID(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+
+async function awaitRemoteResult(cmdID: string, timeoutMs: number = 10000): Promise<CommandResult | null> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await readCommandResult(cmdID)
+    if (result) return result
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  return null
+}
+
+export async function handleQuestionReply(text: string, expectedSessionID?: string): Promise<string> {
+  if (!storedClient) {
+    return "No pending question"
+  }
+
+  if (!pendingQuestion || (expectedSessionID && pendingQuestion.sessionID !== expectedSessionID)) {
+    pendingQuestion = expectedSessionID
+      ? await fetchPendingQuestions(expectedSessionID)
+      : await fetchAnyPendingQuestion()
+  }
+
+  if (!pendingQuestion && expectedSessionID) {
+    const shared = readSharedPendingQuestion()
+    if (shared && shared.sessionID === expectedSessionID) {
+      pendingQuestion = shared
+    }
+  }
+
+  if (!pendingQuestion || (expectedSessionID && pendingQuestion.sessionID !== expectedSessionID)) {
     return "No pending question"
   }
 
@@ -408,7 +452,79 @@ function isOpenCodeProcess(pid: number): boolean {
   }
 }
 
-function acquirePollLock(): boolean {
+function startPollLockRefresh(): void {
+  if (!upstashLockConfig) return
+  if (pollLockRefreshInterval) {
+    clearInterval(pollLockRefreshInterval)
+    pollLockRefreshInterval = null
+  }
+  pollLockRefreshInterval = setInterval(() => {
+    if (!upstashLockConfig) return
+    void upstashCommand(upstashLockConfig.url, upstashLockConfig.token, [
+      "SET",
+      POLL_LOCK_KEY,
+      INSTANCE_IDENTITY,
+      "EX",
+      String(POLL_LOCK_TTL_SECONDS),
+    ]).catch(() => {})
+  }, POLL_LOCK_REFRESH_MS)
+}
+
+function stopPollLockRefresh(): void {
+  if (!pollLockRefreshInterval) return
+  clearInterval(pollLockRefreshInterval)
+  pollLockRefreshInterval = null
+}
+
+async function acquirePollLock(): Promise<boolean> {
+  if (upstashLockConfig) {
+    const result = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, [
+      "SET",
+      POLL_LOCK_KEY,
+      INSTANCE_IDENTITY,
+      "NX",
+      "EX",
+      String(POLL_LOCK_TTL_SECONDS),
+    ])
+    if (result === "OK") {
+      startPollLockRefresh()
+      return true
+    }
+
+    const current = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, ["GET", POLL_LOCK_KEY])
+    if (current === INSTANCE_IDENTITY) {
+      await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, [
+        "SET", POLL_LOCK_KEY, INSTANCE_IDENTITY, "EX", String(POLL_LOCK_TTL_SECONDS),
+      ])
+      startPollLockRefresh()
+      return true
+    }
+
+    const ttl = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, ["TTL", POLL_LOCK_KEY])
+    if (typeof ttl === "number" && ttl <= 5) {
+      await new Promise(r => setTimeout(r, (ttl + 1) * 1000))
+      const retry = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, [
+        "SET", POLL_LOCK_KEY, INSTANCE_IDENTITY, "NX", "EX", String(POLL_LOCK_TTL_SECONDS),
+      ])
+      if (retry === "OK") {
+        startPollLockRefresh()
+        return true
+      }
+    }
+
+    if (typeof ttl === "number" && ttl < 0) {
+      const retry = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, [
+        "SET", POLL_LOCK_KEY, INSTANCE_IDENTITY, "NX", "EX", String(POLL_LOCK_TTL_SECONDS),
+      ])
+      if (retry === "OK") {
+        startPollLockRefresh()
+        return true
+      }
+    }
+
+    return false
+  }
+
   try {
     mkdirSync(join(homedir(), ".config", "opencode"), { recursive: true })
   } catch {}
@@ -430,7 +546,18 @@ function acquirePollLock(): boolean {
   }
 }
 
-function releasePollLock(): void {
+async function releasePollLock(): Promise<void> {
+  stopPollLockRefresh()
+
+  if (upstashLockConfig) {
+    try {
+      const current = await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, ["GET", POLL_LOCK_KEY])
+      if (current === INSTANCE_IDENTITY) {
+        await upstashCommand(upstashLockConfig.url, upstashLockConfig.token, ["DEL", POLL_LOCK_KEY])
+      }
+    } catch {}
+  }
+
   try {
     if (existsSync(LOCK_PATH)) {
       const pid = parseInt(readFileSync(LOCK_PATH, "utf-8").trim(), 10)
@@ -568,35 +695,42 @@ function buildCommandHandlers(
     },
 
     sessions: async () => {
-      const all = readAllSharedSessions()
-      if (all.length === 0) return "📭 No sessions found"
+      const groups = readGroupedSessions()
+      const totalSessions = groups.reduce((n, g) => n + g.sessions.length, 0)
+      if (totalSessions === 0) return "📭 No sessions found"
 
       const statusOrder = { busy: 0, error: 1, idle: 2 }
-      all.sort((a, b) => {
-        const sa = statusOrder[a.status] ?? 2
-        const sb = statusOrder[b.status] ?? 2
-        if (sa !== sb) return sa - sb
-        return b.lastActivityAt - a.lastActivityAt
-      })
+      for (const group of groups) {
+        group.sessions.sort((a, b) => {
+          const sa = statusOrder[a.status] ?? 2
+          const sb = statusOrder[b.status] ?? 2
+          if (sa !== sb) return sa - sb
+          return b.lastActivityAt - a.lastActivityAt
+        })
+      }
+      groups.sort((a, b) => (a.isLocal ? -1 : 0) - (b.isLocal ? -1 : 0))
 
-      sessionListCache = all.map((s) => ({
-        id: s.sessionID,
-        title: s.title || "Untitled",
-      }))
-
-      const lines = [`📋 <b>Sessions</b> (${all.length})\n`]
-      for (let i = 0; i < sessionListCache.length; i++) {
-        const s = sessionListCache[i]
-        const info = all[i]
-        const emoji = info.status === "busy" ? "🔄" : info.status === "error" ? "❌" : "✅"
-        const connected = s.id === connectedSessionID ? " 📍" : ""
-        const project = info.projectName
-          ? ` <i>[${escapeHtml(info.projectName)}]</i>`
-          : ""
-        lines.push(`<b>${i + 1}.</b> ${emoji} ${escapeHtml(s.title)}${project}${connected}`)
+      sessionListCache = []
+      const lines = [`📋 <b>Sessions</b> (${totalSessions})\n`]
+      let idx = 0
+      for (const group of groups) {
+        const tag = group.isLocal ? "local" : "remote"
+        lines.push(`🖥 <b>${escapeHtml(group.hostname)}</b> <i>(${tag})</i>`)
+        for (const info of group.sessions) {
+          idx++
+          const title = info.title || "Untitled"
+          sessionListCache.push({ id: info.sessionID, title })
+          const emoji = info.status === "busy" ? "🔄" : info.status === "error" ? "❌" : "✅"
+          const connected = info.sessionID === connectedSessionID ? " 📍" : ""
+          const project = info.projectName
+            ? ` <i>[${escapeHtml(info.projectName)}]</i>`
+            : ""
+          lines.push(`  <b>${idx}.</b> ${emoji} ${escapeHtml(title)}${project}${connected}`)
+        }
+        lines.push("")
       }
 
-      lines.push(`\nReply with a number to connect`)
+      lines.push(`Reply with a number to connect`)
       if (connectedSessionID) {
         lines.push(`📍 Connected: <b>${escapeHtml(connectedSessionTitle || "Untitled")}</b>`)
       }
@@ -886,6 +1020,90 @@ function startPolling(
           const parsed = parseCommand(msg.text)
 
           if (parsed) {
+            if (parsed.command === "stop") {
+              if (!connectedSessionID) {
+                await telegramApiCall(config.botToken, "sendMessage", {
+                  chat_id: config.chatId,
+                  text: "Not connected. Use /sessions to pick a session first.",
+                }).catch(() => {})
+                continue
+              }
+
+              if (isLocalSession(connectedSessionID)) {
+                try {
+                  await client.session.abort({ path: { id: connectedSessionID } })
+                  clearStreamingState()
+                  await telegramApiCall(config.botToken, "sendMessage", {
+                    chat_id: config.chatId,
+                    text: `⏹ Stopped: <b>${escapeHtml(connectedSessionTitle || "Untitled")}</b>`,
+                    parse_mode: "HTML",
+                  })
+                } catch {
+                  await telegramApiCall(config.botToken, "sendMessage", {
+                    chat_id: config.chatId,
+                    text: "❌ Failed to stop session",
+                  }).catch(() => {})
+                }
+                continue
+              }
+
+              const cmdID = createCommandID()
+              const remoteCmd: RemoteCommand = {
+                id: cmdID,
+                type: "stop",
+                sessionID: connectedSessionID,
+                createdAt: Date.now(),
+              }
+              void writeRemoteCommand(remoteCmd)
+              const result = await awaitRemoteResult(cmdID)
+              const message = result
+                ? result.response
+                : "⏱ Remote command timed out"
+              await telegramApiCall(config.botToken, "sendMessage", {
+                chat_id: config.chatId,
+                text: message,
+                parse_mode: "HTML",
+              }).catch(() => {})
+              continue
+            }
+
+            if (parsed.command === "cancel") {
+              const busy = getBusySessions()
+              const localResults: string[] = []
+              for (const session of busy) {
+                try {
+                  await client.session.abort({ path: { id: session.sessionID } })
+                  const title = session.title ? escapeHtml(session.title) : session.sessionID.slice(0, 8)
+                  localResults.push(`⏹ Cancelled: <b>${title}</b>`)
+                } catch {
+                  localResults.push(`❌ Failed to cancel: ${escapeHtml(session.sessionID.slice(0, 8))}`)
+                }
+              }
+
+              const cmdID = createCommandID()
+              const remoteCmd: RemoteCommand = {
+                id: cmdID,
+                type: "cancel",
+                createdAt: Date.now(),
+              }
+              void writeRemoteCommand(remoteCmd)
+
+              const lines: string[] = []
+              if (localResults.length > 0) {
+                lines.push(localResults.join("\n"))
+              } else {
+                lines.push("💤 Nothing to cancel locally")
+              }
+              lines.push("📡 Broadcast cancel sent")
+
+              await telegramApiCall(config.botToken, "sendMessage", {
+                chat_id: config.chatId,
+                text: lines.join("\n\n"),
+                parse_mode: "HTML",
+              }).catch(() => {})
+              continue
+            }
+
             const handler = handlers[parsed.command]
             if (!handler) continue
 
@@ -917,7 +1135,29 @@ function startPolling(
             if (pendingQuestion) {
               const answerText = customAnswerMatch ? customAnswerMatch[1].trim() : text
               try {
-                const response = await handleQuestionReply(answerText)
+                if (isLocalSession(pendingQuestion.sessionID)) {
+                  const response = await handleQuestionReply(answerText, pendingQuestion.sessionID)
+                  await telegramApiCall(config.botToken, "sendMessage", {
+                    chat_id: config.chatId,
+                    text: response,
+                    parse_mode: "HTML",
+                  })
+                  continue
+                }
+
+                const cmdID = createCommandID()
+                const remoteCmd: RemoteCommand = {
+                  id: cmdID,
+                  type: "question_answer",
+                  sessionID: pendingQuestion.sessionID,
+                  args: { answer: answerText },
+                  createdAt: Date.now(),
+                }
+                void writeRemoteCommand(remoteCmd)
+                const result = await awaitRemoteResult(cmdID)
+                const response = result
+                  ? result.response
+                  : "⏱ Remote command timed out"
                 await telegramApiCall(config.botToken, "sendMessage", {
                   chat_id: config.chatId,
                   text: response,
@@ -948,10 +1188,39 @@ function startPolling(
 
           if (connectedSessionID && text.length > 0) {
             try {
-              await client.session.promptAsync({
-                path: { id: connectedSessionID },
-                body: buildPromptBody(text),
-              })
+              if (isLocalSession(connectedSessionID)) {
+                await client.session.promptAsync({
+                  path: { id: connectedSessionID },
+                  body: buildPromptBody(text),
+                })
+              } else {
+                const cmdID = createCommandID()
+                const remoteCmd: RemoteCommand = {
+                  id: cmdID,
+                  type: "prompt",
+                  sessionID: connectedSessionID,
+                  args: { text },
+                  createdAt: Date.now(),
+                }
+                void writeRemoteCommand(remoteCmd)
+                const result = await awaitRemoteResult(cmdID)
+                if (!result) {
+                  await telegramApiCall(config.botToken, "sendMessage", {
+                    chat_id: config.chatId,
+                    text: "⏱ Remote command timed out",
+                    parse_mode: "HTML",
+                  }).catch(() => {})
+                  continue
+                }
+                if (!result.ok) {
+                  await telegramApiCall(config.botToken, "sendMessage", {
+                    chat_id: config.chatId,
+                    text: result.response,
+                    parse_mode: "HTML",
+                  }).catch(() => {})
+                  continue
+                }
+              }
               await telegramApiCall(config.botToken, "sendMessage", {
                 chat_id: config.chatId,
                 text: `📨 <i>${escapeHtml(truncate(text, 100))}</i>`,
@@ -996,29 +1265,33 @@ export function isMuted(): boolean {
   return muted
 }
 
-export function createTelegramBot(
-  config: TelegramConfig,
+export async function createTelegramBot(
+  config: NotifierConfig,
   client: PluginInput["client"],
-): TelegramBot | null {
-  if (!config.enabled || !config.botToken || !config.chatId) {
+): Promise<TelegramBot | null> {
+  const telegramConfig = config.telegram
+
+  if (!telegramConfig.enabled || !telegramConfig.botToken || !telegramConfig.chatId) {
     return null
   }
 
-  storedBotToken = config.botToken
-  storedChatId = config.chatId
+  upstashLockConfig = isUpstashConfigured(config) && config.upstash ? config.upstash : null
+
+  storedBotToken = telegramConfig.botToken
+  storedChatId = telegramConfig.chatId
   storedClient = client
 
-  const isPoller = acquirePollLock()
+  const isPoller = await acquirePollLock()
   let poller: { stop: () => void } | null = null
 
   if (isPoller) {
     const handlers = buildCommandHandlers(client)
-    poller = startPolling(config, handlers, client)
+    poller = startPolling(telegramConfig, handlers, client)
 
-    const cleanup = () => releasePollLock()
-    process.on("exit", cleanup)
-    process.on("SIGINT", () => { cleanup(); process.exit(0) })
-    process.on("SIGTERM", () => { cleanup(); process.exit(0) })
+    const asyncCleanup = async () => { await releasePollLock() }
+    process.on("exit", () => { stopPollLockRefresh(); try { if (existsSync(LOCK_PATH)) { const pid = parseInt(readFileSync(LOCK_PATH, "utf-8").trim(), 10); if (pid === process.pid) unlinkSync(LOCK_PATH) } } catch {} })
+    process.on("SIGINT", () => { asyncCleanup().finally(() => process.exit(0)) })
+    process.on("SIGTERM", () => { asyncCleanup().finally(() => process.exit(0)) })
   }
 
   return {
@@ -1026,8 +1299,8 @@ export function createTelegramBot(
       if (muted) return
 
       try {
-        await telegramApiCall(config.botToken, "sendMessage", {
-          chat_id: config.chatId,
+        await telegramApiCall(telegramConfig.botToken, "sendMessage", {
+          chat_id: telegramConfig.chatId,
           text,
           parse_mode: "HTML",
         })
@@ -1040,8 +1313,8 @@ export function createTelegramBot(
 
       try {
         const summary = await buildCompletionSummary(client, sessionID, eventType, projectName)
-        await telegramApiCall(config.botToken, "sendMessage", {
-          chat_id: config.chatId,
+        await telegramApiCall(telegramConfig.botToken, "sendMessage", {
+          chat_id: telegramConfig.chatId,
           text: summary,
           parse_mode: "HTML",
         })
@@ -1049,10 +1322,10 @@ export function createTelegramBot(
       }
     },
 
-    stop() {
+    async stop() {
       clearStreamingState()
       if (poller) poller.stop()
-      if (isPoller) releasePollLock()
+      if (isPoller) await releasePollLock()
     },
   }
 }
@@ -1095,7 +1368,7 @@ async function buildCompletionSummary(
     interrupted: "⏹",
     permission: "🔐",
   }
-  const emoji = eventEmoji[eventType] ?? "📢"
+  let emoji = eventEmoji[eventType] ?? "📢"
 
   let title = "Untitled"
   let duration = ""
@@ -1118,6 +1391,10 @@ async function buildCompletionSummary(
       if (parts.length > 0) diffSummary = `\n📁 ${parts.join(" | ")}`
     }
   } catch {}
+
+  if (eventType === "error" && diffSummary.length > 0) {
+    emoji = "⚠️"
+  }
 
   const projectTag = projectName ? `[${escapeHtml(projectName)}] ` : ""
   const lines: string[] = [

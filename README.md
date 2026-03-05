@@ -99,13 +99,30 @@ Toggle per-event notifications in the config:
 
 ## Multi-Instance Support
 
-If you run OpenCode in multiple terminals/projects simultaneously:
+### Same machine
 
-- Only one instance polls Telegram for commands (lock file based)
-- All instances send push notifications
-- Session state is shared via files in `~/.config/opencode/notifier/`
-- Questions asked in any instance can be answered from Telegram
+Works out of the box. Multiple OpenCode instances share session state via files in `~/.config/opencode/notifier/`. Only one instance polls Telegram for commands (lock file based); all instances send push notifications.
 
+### Multiple machines (Upstash Redis)
+
+To share sessions across machines, add an [Upstash Redis](https://upstash.com) backend. Create a free Upstash Redis database, then add it to your config on each machine:
+
+```json
+{
+  "telegram": { ... },
+  "upstash": {
+    "url": "https://your-db.upstash.io",
+    "token": "YOUR_UPSTASH_TOKEN"
+  }
+}
+```
+
+With Upstash configured:
+
+- Sessions from all machines appear in `/sessions` and `/status`
+- Only one instance across all machines polls Telegram (distributed lock)
+- Questions from any machine can be answered via the bot
+- If Upstash is unreachable, falls back to local-only mode
 ## Config Reference
 
 Full config at `~/.config/opencode/opencode-notifier.json`:
@@ -125,6 +142,10 @@ Full config at `~/.config/opencode/opencode-notifier.json`:
       "interrupted": true
     }
   },
+  "upstash": {
+    "url": "https://your-db.upstash.io",
+    "token": "YOUR_UPSTASH_TOKEN"
+  },
   "showProjectName": true,
   "showSessionTitle": true,
   "messages": {
@@ -134,11 +155,11 @@ Full config at `~/.config/opencode/opencode-notifier.json`:
     "error": "Session encountered an error: {sessionTitle}",
     "question": "Session has a question: {sessionTitle}"
   }
-}
 ```
 
 - `showProjectName` - Include project folder name in notifications (default: true)
 - `showSessionTitle` - Include session title in notification messages (default: true)
+- `upstash` - Optional. Upstash Redis URL and token for cross-machine session sharing.
 - `messages` - Customize notification text. Supports `{sessionTitle}` and `{projectName}` placeholders.
 
 ## Troubleshooting

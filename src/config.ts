@@ -18,6 +18,11 @@ export interface TelegramConfig {
   }
 }
 
+export interface UpstashConfig {
+  url: string
+  token: string
+}
+
 export interface MessageContext {
   sessionTitle?: string | null
   projectName?: string | null
@@ -27,6 +32,7 @@ export interface NotifierConfig {
   showProjectName: boolean
   showSessionTitle: boolean
   telegram: TelegramConfig
+  upstash?: UpstashConfig
   messages: {
     permission: string
     complete: string
@@ -85,6 +91,13 @@ export function loadConfig(): NotifierConfig {
 
     const userTelegram = userConfig.telegram ?? {}
     const telegramEvents = userTelegram.events ?? {}
+    const userUpstash = userConfig.upstash
+    const upstash =
+      userUpstash && typeof userUpstash === "object" &&
+      typeof userUpstash.url === "string" && userUpstash.url.length > 0 &&
+      typeof userUpstash.token === "string" && userUpstash.token.length > 0
+        ? { url: userUpstash.url, token: userUpstash.token }
+        : undefined
 
     return {
       showProjectName: userConfig.showProjectName ?? DEFAULT_CONFIG.showProjectName,
@@ -102,6 +115,7 @@ export function loadConfig(): NotifierConfig {
           interrupted: typeof telegramEvents.interrupted === "boolean" ? telegramEvents.interrupted : DEFAULT_TELEGRAM_CONFIG.events.interrupted,
         },
       },
+      upstash,
       messages: {
         permission: userConfig.messages?.permission ?? DEFAULT_CONFIG.messages.permission,
         complete: userConfig.messages?.complete ?? DEFAULT_CONFIG.messages.complete,
@@ -121,6 +135,10 @@ export function isTelegramEventEnabled(config: NotifierConfig, event: EventType)
     return false
   }
   return config.telegram.events[event] ?? false
+}
+
+export function isUpstashConfigured(config: NotifierConfig): boolean {
+  return !!(config.upstash?.url && config.upstash?.token)
 }
 
 export function getMessage(config: NotifierConfig, event: EventType): string {
