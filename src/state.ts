@@ -68,6 +68,13 @@ export interface CommandResult {
 let upstashConfig: { url: string; token: string } | null = null
 let upstashSessionsCache: { groups: Map<string, SharedSessionInfo[]>; expiresAt: number } | null = null
 let upstashSessionsRefreshPromise: Promise<void> | null = null
+let sseAbortController: AbortController | null = null
+let sseReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let commandHandler: ((cmd: RemoteCommand) => void) | null = null
+
+const CMD_CHANNEL = "opencode:commands"
+const RESULT_CHANNEL = "opencode:results"
+const QUESTION_CHANNEL = "opencode:questions"
 
 export function initUpstash(config: { url: string; token: string }): void {
   upstashConfig = config
@@ -92,6 +99,120 @@ export async function upstashCommand(
     return data?.result
   } catch {
     return null
+  }
+}
+
+export async function upstashPipeline(commands: string[][]): Promise<any[] | null> {
+  if (!upstashConfig) return null
+  try {
+    const response = await fetch(`${upstashConfig.url}/pipeline`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${upstashConfig.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(commands),
+    })
+    if (!response.ok) return null
+    const data = await response.json().catch(() => null)
+    if (!Array.isArray(data)) return null
+    return data.map((item: any) => item?.result ?? null)
+  } catch {
+    return null
+  }
+}
+
+async function upstashPublish(channel: string, message: string): Promise<void> {
+  if (!upstashConfig) return
+  await upstashCommand(upstashConfig.url, upstashConfig.token, ["PUBLISH", channel, message])
+}
+
+export function publishCommand(cmd: RemoteCommand): Promise<void> {
+  return upstashPublish(CMD_CHANNEL, JSON.stringify(cmd))
+}
+
+export function publishCommandResult(result: CommandResult): Promise<void> {
+  return upstashPublish(RESULT_CHANNEL, JSON.stringify(result))
+}
+
+export function publishQuestion(question: SharedPendingQuestion): Promise<void> {
+  return upstashPublish(QUESTION_CHANNEL, JSON.stringify(question))
+}
+
+type SSEMessageHandler = (channel: string, message: string) => void
+
+export function startSSESubscription(onMessage: SSEMessageHandler): void {
+  if (!upstashConfig) return
+  connectSSE(onMessage)
+}
+
+function connectSSE(onMessage: SSEMessageHandler): void {
+  if (!upstashConfig) return
+  sseAbortController?.abort()
+  sseAbortController = new AbortController()
+
+  const url = `${upstashConfig.url}/subscribe/${CMD_CHANNEL}/${RESULT_CHANNEL}/${QUESTION_CHANNEL}`
+  void (async () => {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${upstashConfig!.token}`,
+          Accept: "text/event-stream",
+        },
+        signal: sseAbortController!.signal,
+      })
+      if (!response.ok || !response.body) {
+        scheduleSSEReconnect(onMessage)
+        return
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() ?? ""
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue
+          const payload = line.slice(6)
+          const firstComma = payload.indexOf(",")
+          if (firstComma < 0) continue
+          const type = payload.slice(0, firstComma)
+          if (type !== "message") continue
+          const rest = payload.slice(firstComma + 1)
+          const secondComma = rest.indexOf(",")
+          if (secondComma < 0) continue
+          const channel = rest.slice(0, secondComma)
+          const message = rest.slice(secondComma + 1)
+          onMessage(channel, message)
+        }
+      }
+      scheduleSSEReconnect(onMessage)
+    } catch (e: any) {
+      if (e?.name === "AbortError") return
+      scheduleSSEReconnect(onMessage)
+    }
+  })()
+}
+
+function scheduleSSEReconnect(onMessage: SSEMessageHandler): void {
+  if (sseReconnectTimer) return
+  sseReconnectTimer = setTimeout(() => {
+    sseReconnectTimer = null
+    connectSSE(onMessage)
+  }, 3000)
+}
+
+export function stopSSESubscription(): void {
+  sseAbortController?.abort()
+  sseAbortController = null
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer)
+    sseReconnectTimer = null
   }
 }
 
@@ -154,7 +275,7 @@ function scheduleSharedStateWrite(): void {
   sharedStateTimer = setTimeout(() => {
     sharedStateTimer = null
     writeSharedStateNow()
-  }, 2000)
+  }, upstashConfig ? 30000 : 2000)
 }
 
 export function readAllSharedSessions(): SharedSessionInfo[] {
@@ -239,13 +360,13 @@ function refreshUpstashSessionsCache(): void {
       ? keysResult.filter((key): key is string => typeof key === "string" && key.length > 0)
       : []
     if (keys.length === 0) {
-      upstashSessionsCache = { groups: new Map(), expiresAt: Date.now() + 3000 }
+      upstashSessionsCache = { groups: new Map(), expiresAt: Date.now() + 30000 }
       return
     }
 
     const values = await upstashCommand(upstashConfig.url, upstashConfig.token, ["MGET", ...keys])
     if (!Array.isArray(values)) {
-      upstashSessionsCache = { groups: upstashSessionsCache?.groups ?? new Map(), expiresAt: Date.now() + 3000 }
+      upstashSessionsCache = { groups: upstashSessionsCache?.groups ?? new Map(), expiresAt: Date.now() + 30000 }
       return
     }
 
@@ -275,7 +396,7 @@ function refreshUpstashSessionsCache(): void {
     for (const [host, best] of grouped) {
       result.set(host, Array.from(best.values()))
     }
-    upstashSessionsCache = { groups: result, expiresAt: Date.now() + 3000 }
+    upstashSessionsCache = { groups: result, expiresAt: Date.now() + 30000 }
   })()
     .catch(() => {})
     .finally(() => {
@@ -467,55 +588,19 @@ export function writeSharedPendingQuestion(question: SharedPendingQuestion): voi
     writeFileSync(PENDING_QUESTION_PATH, JSON.stringify(question))
   } catch {}
   if (upstashConfig) {
-    void upstashCommand(
-      upstashConfig.url,
-      upstashConfig.token,
-      ["SET", "question:pending", JSON.stringify(question), "EX", "300"]
-    ).catch(() => {})
+    void publishQuestion(question).catch(() => {})
   }
 }
 
 export function readSharedPendingQuestion(): SharedPendingQuestion | null {
-  if (upstashConfig) {
-    refreshSharedPendingQuestionCache()
-    const cached = sharedPendingQuestionCache
-    if (cached !== undefined) {
-      return cached
-    }
+  if (sharedPendingQuestionCache) {
+    return sharedPendingQuestionCache
   }
-
   return readSharedPendingQuestionFromFile()
 }
 
 let sharedPendingQuestionCache: SharedPendingQuestion | null | undefined
 let sharedPendingQuestionCacheAt = 0
-let sharedPendingQuestionRefreshPromise: Promise<void> | null = null
-
-function refreshSharedPendingQuestionCache(): void {
-  if (!upstashConfig || sharedPendingQuestionRefreshPromise) return
-  if (Date.now() - sharedPendingQuestionCacheAt < 3000) return
-
-  sharedPendingQuestionRefreshPromise = (async () => {
-    const raw = await upstashCommand(upstashConfig.url, upstashConfig.token, ["GET", "question:pending"])
-    sharedPendingQuestionCacheAt = Date.now()
-    if (typeof raw !== "string") {
-      sharedPendingQuestionCache = readSharedPendingQuestionFromFile()
-      return
-    }
-
-    try {
-      const parsed = JSON.parse(raw)
-      const question = normalizeSharedPendingQuestion(parsed)
-      sharedPendingQuestionCache = question ?? readSharedPendingQuestionFromFile()
-    } catch {
-      sharedPendingQuestionCache = readSharedPendingQuestionFromFile()
-    }
-  })()
-    .catch(() => {})
-    .finally(() => {
-      sharedPendingQuestionRefreshPromise = null
-    })
-}
 
 function normalizeSharedPendingQuestion(parsed: any): SharedPendingQuestion | null {
   if (!parsed?.requestID || !parsed?.questions) return null
@@ -542,53 +627,10 @@ export function clearSharedPendingQuestion(): void {
   try { unlinkSync(PENDING_QUESTION_PATH) } catch {}
   sharedPendingQuestionCache = null
   sharedPendingQuestionCacheAt = Date.now()
-  if (upstashConfig) {
-    void upstashCommand(upstashConfig.url, upstashConfig.token, ["DEL", "question:pending"]).catch(() => {})
-  }
 }
 
 export async function writeRemoteCommand(cmd: RemoteCommand): Promise<void> {
-  if (!upstashConfig) return
-  try {
-    await upstashCommand(upstashConfig.url, upstashConfig.token, [
-      "SET",
-      `cmd:${cmd.id}`,
-      JSON.stringify(cmd),
-      "EX",
-      "30",
-    ])
-  } catch {}
-}
-
-export async function readPendingCommands(): Promise<RemoteCommand[]> {
-  if (!upstashConfig) return []
-  try {
-    const keysResult = await upstashCommand(upstashConfig.url, upstashConfig.token, ["KEYS", "cmd:*"])
-    const keys = Array.isArray(keysResult)
-      ? keysResult.filter(
-          (key): key is string =>
-            typeof key === "string" && key.length > 0 && !key.endsWith(":claimed")
-        )
-      : []
-    if (keys.length === 0) return []
-
-    const values = await upstashCommand(upstashConfig.url, upstashConfig.token, ["MGET", ...keys])
-    if (!Array.isArray(values)) return []
-
-    const commands: RemoteCommand[] = []
-    for (const raw of values) {
-      if (typeof raw !== "string") continue
-      try {
-        const parsed = JSON.parse(raw) as RemoteCommand
-        if (typeof parsed?.id === "string" && typeof parsed?.type === "string") {
-          commands.push(parsed)
-        }
-      } catch {}
-    }
-    return commands
-  } catch {
-    return []
-  }
+  await publishCommand(cmd)
 }
 
 export async function claimCommand(cmdID: string): Promise<boolean> {
@@ -609,40 +651,59 @@ export async function claimCommand(cmdID: string): Promise<boolean> {
 }
 
 export async function writeCommandResult(result: CommandResult): Promise<void> {
-  if (!upstashConfig) return
+  await publishCommandResult(result)
+}
+
+const pendingResultCallbacks = new Map<string, (result: CommandResult) => void>()
+
+export function onCommandResult(cmdID: string, timeout: number): Promise<CommandResult | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingResultCallbacks.delete(cmdID)
+      resolve(null)
+    }, timeout)
+    pendingResultCallbacks.set(cmdID, (result) => {
+      clearTimeout(timer)
+      pendingResultCallbacks.delete(cmdID)
+      resolve(result)
+    })
+  })
+}
+
+export function handleSSEMessage(channel: string, message: string): void {
   try {
-    await upstashCommand(upstashConfig.url, upstashConfig.token, [
-      "SET",
-      `result:${result.id}`,
-      JSON.stringify(result),
-      "EX",
-      "60",
-    ])
+    if (channel === RESULT_CHANNEL) {
+      const parsed = JSON.parse(message) as CommandResult
+      if (parsed?.id && pendingResultCallbacks.has(parsed.id)) {
+        pendingResultCallbacks.get(parsed.id)!(parsed)
+      }
+      return
+    }
+    if (channel === QUESTION_CHANNEL) {
+      const parsed = JSON.parse(message)
+      const question = normalizeSharedPendingQuestion(parsed)
+      if (question) {
+        sharedPendingQuestionCache = question
+        sharedPendingQuestionCacheAt = Date.now()
+      }
+      return
+    }
+    if (channel === CMD_CHANNEL) {
+      const parsed = JSON.parse(message) as RemoteCommand
+      if (typeof parsed?.id === "string" && typeof parsed?.type === "string") {
+        commandHandler?.(parsed)
+      }
+    }
   } catch {}
 }
 
-export async function readCommandResult(cmdID: string): Promise<CommandResult | null> {
-  if (!upstashConfig) return null
-  try {
-    const raw = await upstashCommand(upstashConfig.url, upstashConfig.token, ["GET", `result:${cmdID}`])
-    if (typeof raw !== "string") return null
-    const parsed = JSON.parse(raw) as CommandResult
-    if (
-      typeof parsed?.id !== "string" ||
-      typeof parsed?.response !== "string" ||
-      typeof parsed?.ok !== "boolean"
-    ) {
-      return null
-    }
-    return parsed
-  } catch {
-    return null
-  }
+export function setCommandHandler(handler: (cmd: RemoteCommand) => void): void {
+  commandHandler = handler
 }
 
 export async function deleteCommand(cmdID: string): Promise<void> {
   if (!upstashConfig) return
   try {
-    await upstashCommand(upstashConfig.url, upstashConfig.token, ["DEL", `cmd:${cmdID}`])
+    await upstashCommand(upstashConfig.url, upstashConfig.token, ["DEL", `cmd:${cmdID}:claimed`])
   } catch {}
 }

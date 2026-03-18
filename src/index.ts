@@ -32,9 +32,10 @@ import {
   cleanupStaleSessions,
   setFullSessionList,
   initUpstash,
-  readPendingCommands,
+  setCommandHandler,
   writeCommandResult,
   type SharedSessionInfo,
+  type RemoteCommand,
 } from "./state"
 
 const IDLE_COMPLETE_DELAY_MS = 350
@@ -238,123 +239,89 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
   }
   telegramBot = await createTelegramBot(initialConfig, client)
 
-  let remoteCommandInFlight = false
-  let remoteCommandInterval: ReturnType<typeof setInterval> | null = null
   const processedCancelCommands = new Set<string>()
   if (isUpstashConfigured(initialConfig) && upstash) {
-    remoteCommandInterval = setInterval(() => {
-      if (remoteCommandInFlight) return
-      remoteCommandInFlight = true
-      void (async () => {
-        const commands = await readPendingCommands()
-        for (const cmd of commands) {
-          const isCancel = cmd.type === "cancel"
-          const isNew = cmd.type === "new"
-          if (isCancel) {
-            if (processedCancelCommands.has(cmd.id)) continue
-            processedCancelCommands.add(cmd.id)
-            if (processedCancelCommands.size > 1000) {
-              processedCancelCommands.clear()
-            }
+    const handleRemoteCommand = async (cmd: RemoteCommand) => {
+      const isCancel = cmd.type === "cancel"
+      const isNew = cmd.type === "new"
+      if (isCancel) {
+        if (processedCancelCommands.has(cmd.id)) return
+        processedCancelCommands.add(cmd.id)
+        if (processedCancelCommands.size > 1000) processedCancelCommands.clear()
 
-            const busy = getBusySessions()
-            const results: string[] = []
-            for (const session of busy) {
-              try {
-                await client.session.abort({ path: { id: session.sessionID } })
-                const title = session.title ? session.title : session.sessionID.slice(0, 8)
-                results.push(`⏹ Cancelled: <b>${title}</b>`)
-              } catch {
-                results.push(`❌ Failed to cancel: ${session.sessionID.slice(0, 8)}`)
-              }
-            }
-
-            const claimed = await claimCommand(cmd.id)
-            if (claimed) {
-              const response =
-                results.length > 0 ? results.join("\n") : "💤 Nothing to cancel — no active sessions"
-              await writeCommandResult({ id: cmd.id, response, ok: true })
-            }
-            continue
-          }
-
-          if (!isCancel && !isNew) {
-            if (!cmd.sessionID || !isLocalSession(cmd.sessionID)) continue
-          }
-
-          const claimed = await claimCommand(cmd.id)
-          if (!claimed) continue
-
-          let response = ""
-          let ok = true
-
+        const busy = getBusySessions()
+        const results: string[] = []
+        for (const session of busy) {
           try {
-            if (cmd.type === "prompt") {
-              if (!cmd.sessionID) {
-                throw new Error("missing session")
-              }
-              const text = String(cmd.args?.text ?? "").trim()
-              if (!text) {
-                throw new Error("empty prompt")
-              }
-              await client.session.promptAsync({
-                path: { id: cmd.sessionID },
-                body: { parts: [{ type: "text", text }] },
-              })
-              response = `📨 <i>${text.slice(0, 100)}</i>`
-            } else if (cmd.type === "stop") {
-              if (!cmd.sessionID) {
-                throw new Error("missing session")
-              }
-              await client.session.abort({ path: { id: cmd.sessionID } })
-              response = "⏹ Stopped"
-            } else if (cmd.type === "new") {
-              const text = String(cmd.args?.text ?? "").trim()
-              if (!text) {
-                throw new Error("empty prompt")
-              }
-              const createResp = await client.session.create({})
-              const newSession = createResp.data
-              if (!newSession?.id) {
-                throw new Error("failed to create session")
-              }
-              await client.session.promptAsync({
-                path: { id: newSession.id },
-                body: { parts: [{ type: "text", text }] },
-              })
-              response = `🆕 New session started\n\n📨 <i>${text.slice(0, 200)}</i>`
-            } else if (cmd.type === "question_answer") {
-              const answer = String(cmd.args?.answer ?? "").trim()
-              if (!answer) {
-                throw new Error("empty answer")
-              }
-              response = await handleQuestionReply(answer, cmd.sessionID)
-            } else {
-              throw new Error("unsupported command")
-            }
-          } catch (error: any) {
-            ok = false
-            response = `❌ ${String(error?.message ?? error).slice(0, 200)}`
+            await client.session.abort({ path: { id: session.sessionID } })
+            const title = session.title ? session.title : session.sessionID.slice(0, 8)
+            results.push(`⏹ Cancelled: <b>${title}</b>`)
+          } catch {
+            results.push(`❌ Failed to cancel: ${session.sessionID.slice(0, 8)}`)
           }
-
-          await writeCommandResult({ id: cmd.id, response, ok })
-          await deleteCommand(cmd.id)
         }
-      })()
-        .catch(() => undefined)
-        .finally(() => {
-          remoteCommandInFlight = false
-        })
-    }, 2500)
 
-    const stopRemoteListener = () => {
-      if (!remoteCommandInterval) return
-      clearInterval(remoteCommandInterval)
-      remoteCommandInterval = null
+        const claimed = await claimCommand(cmd.id)
+        if (claimed) {
+          const response =
+            results.length > 0 ? results.join("\n") : "💤 Nothing to cancel — no active sessions"
+          await writeCommandResult({ id: cmd.id, response, ok: true })
+        }
+        return
+      }
+
+      if (!isCancel && !isNew) {
+        if (!cmd.sessionID || !isLocalSession(cmd.sessionID)) return
+      }
+
+      const claimed = await claimCommand(cmd.id)
+      if (!claimed) return
+
+      let response = ""
+      let ok = true
+
+      try {
+        if (cmd.type === "prompt") {
+          if (!cmd.sessionID) throw new Error("missing session")
+          const text = String(cmd.args?.text ?? "").trim()
+          if (!text) throw new Error("empty prompt")
+          void client.session.prompt({
+            path: { id: cmd.sessionID },
+            body: { parts: [{ type: "text", text }] },
+          }).catch(() => {})
+          response = `📨 <i>${text.slice(0, 100)}</i>`
+        } else if (cmd.type === "stop") {
+          if (!cmd.sessionID) throw new Error("missing session")
+          await client.session.abort({ path: { id: cmd.sessionID } })
+          response = "⏹ Stopped"
+        } else if (cmd.type === "new") {
+          const text = String(cmd.args?.text ?? "").trim()
+          if (!text) throw new Error("empty prompt")
+          const createResp = await client.session.create({})
+          const newSession = createResp.data
+          if (!newSession?.id) throw new Error("failed to create session")
+          void client.session.prompt({
+            path: { id: newSession.id },
+            body: { parts: [{ type: "text", text }] },
+          }).catch(() => {})
+          response = `🆕 New session started\n\n📨 <i>${text.slice(0, 200)}</i>`
+        } else if (cmd.type === "question_answer") {
+          const answer = String(cmd.args?.answer ?? "").trim()
+          if (!answer) throw new Error("empty answer")
+          response = await handleQuestionReply(answer, cmd.sessionID)
+        } else {
+          throw new Error("unsupported command")
+        }
+      } catch (error: any) {
+        ok = false
+        response = `❌ ${String(error?.message ?? error).slice(0, 200)}`
+      }
+
+      await writeCommandResult({ id: cmd.id, response, ok })
+      await deleteCommand(cmd.id)
     }
-    process.on("exit", stopRemoteListener)
-    process.on("SIGINT", stopRemoteListener)
-    process.on("SIGTERM", stopRemoteListener)
+
+    setCommandHandler((cmd) => { void handleRemoteCommand(cmd).catch(() => {}) })
   }
 
   void seedSessionList(client, projectName)
@@ -516,10 +483,6 @@ export const NotifierPlugin: Plugin = async ({ client, directory }) => {
       await handleEvent(config, "permission", projectName)
     },
     dispose: async () => {
-      if (remoteCommandInterval) {
-        clearInterval(remoteCommandInterval)
-        remoteCommandInterval = null
-      }
       for (const [sessionID, timer] of pendingIdleTimers) {
         clearTimeout(timer)
         pendingIdleTimers.delete(sessionID)

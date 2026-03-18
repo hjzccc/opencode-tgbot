@@ -9,13 +9,17 @@ import {
   getSession,
   readAllSharedSessions,
   readGroupedSessions,
-  readCommandResult,
+  onCommandResult,
   trackTodos,
   writeSharedPendingQuestion,
   readSharedPendingQuestion,
   clearSharedPendingQuestion,
   writeRemoteCommand,
   cleanupSharedState,
+  startSSESubscription,
+  stopSSESubscription,
+  handleSSEMessage,
+  setCommandHandler,
   upstashCommand,
   type CommandResult,
   type RemoteCommand,
@@ -301,7 +305,7 @@ export function notifyConnectedSessionIdle(sessionID: string): void {
 const LOCK_PATH = join(homedir(), ".config", "opencode", "notifier-poll.lock")
 const POLL_LOCK_KEY = "poll:lock"
 const POLL_LOCK_TTL_SECONDS = 30
-const POLL_LOCK_REFRESH_MS = 15_000
+const POLL_LOCK_REFRESH_MS = 25_000
 const INSTANCE_IDENTITY = `${hostname()}:${process.pid}`
 let upstashLockConfig: { url: string; token: string } | null = null
 let pollLockRefreshInterval: ReturnType<typeof setInterval> | null = null
@@ -376,13 +380,7 @@ function createCommandID(): string {
 }
 
 async function awaitRemoteResult(cmdID: string, timeoutMs: number = 10000): Promise<CommandResult | null> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const result = await readCommandResult(cmdID)
-    if (result) return result
-    await new Promise((resolve) => setTimeout(resolve, 500))
-  }
-  return null
+  return onCommandResult(cmdID, timeoutMs)
 }
 
 export async function handleQuestionReply(text: string, expectedSessionID?: string): Promise<string> {
@@ -905,10 +903,10 @@ function buildCommandHandlers(
         connectedSessionID = newSession.id
         connectedSessionTitle = "New session"
 
-        await client.session.promptAsync({
+        void client.session.prompt({
           path: { id: newSession.id },
           body: buildPromptBody(args.trim()),
-        })
+        }).catch(() => {})
 
         return `🆕 New session — auto-connected\n\n📨 <i>${escapeHtml(truncate(args.trim(), 200))}</i>\n\nJust type to continue.`
       } catch (e: any) {
@@ -1190,10 +1188,10 @@ function startPolling(
           if (connectedSessionID && text.length > 0) {
             try {
               if (isLocalSession(connectedSessionID)) {
-                await client.session.promptAsync({
+                void client.session.prompt({
                   path: { id: connectedSessionID },
                   body: buildPromptBody(text),
-                })
+                }).catch(() => {})
               } else {
                 const cmdID = createCommandID()
                 const remoteCmd: RemoteCommand = {
@@ -1282,6 +1280,10 @@ export async function createTelegramBot(
   storedChatId = telegramConfig.chatId
   storedClient = client
 
+  if (isUpstashConfigured(config)) {
+    startSSESubscription(handleSSEMessage)
+  }
+
   const isPoller = await acquirePollLock()
   let poller: { stop: () => void } | null = null
 
@@ -1289,14 +1291,14 @@ export async function createTelegramBot(
     const handlers = buildCommandHandlers(client)
     poller = startPolling(telegramConfig, handlers, client)
 
-    const asyncCleanup = async () => { await Promise.all([releasePollLock(), cleanupSharedState()]) }
+    const asyncCleanup = async () => { stopSSESubscription(); await Promise.all([releasePollLock(), cleanupSharedState()]) }
     process.on("exit", () => { stopPollLockRefresh(); try { if (existsSync(LOCK_PATH)) { const pid = parseInt(readFileSync(LOCK_PATH, "utf-8").trim(), 10); if (pid === process.pid) unlinkSync(LOCK_PATH) } } catch {}; try { unlinkSync(join(homedir(), ".config", "opencode", "notifier", `${process.pid}.json`)) } catch {} })
     process.on("SIGINT", () => { asyncCleanup().finally(() => process.exit(0)) })
     process.on("SIGTERM", () => { asyncCleanup().finally(() => process.exit(0)) })
-  }
- else {
-    process.on("SIGINT", () => { cleanupSharedState().finally(() => process.exit(0)) })
-    process.on("SIGTERM", () => { cleanupSharedState().finally(() => process.exit(0)) })
+  } else {
+    const asyncCleanup = async () => { stopSSESubscription(); await cleanupSharedState() }
+    process.on("SIGINT", () => { asyncCleanup().finally(() => process.exit(0)) })
+    process.on("SIGTERM", () => { asyncCleanup().finally(() => process.exit(0)) })
   }
 
   return {
@@ -1329,6 +1331,7 @@ export async function createTelegramBot(
 
     async stop() {
       clearStreamingState()
+      stopSSESubscription()
       if (poller) poller.stop()
       if (isPoller) await releasePollLock()
     },
