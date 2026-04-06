@@ -2,6 +2,22 @@
 
 Telegram remote control for OpenCode. Monitor sessions, send prompts, answer questions, and manage tasks — all from your phone.
 
+## Install
+
+Add to `opencode.json`:
+
+```json
+{
+  "plugin": ["opencode-tgbot"]
+}
+```
+
+Or install from npm:
+
+```bash
+npm install opencode-tgbot
+```
+
 ## Quick Start
 
 1. Create a Telegram bot via [@BotFather](https://t.me/BotFather) and grab the token.
@@ -20,15 +36,7 @@ Telegram remote control for OpenCode. Monitor sessions, send prompts, answer que
 }
 ```
 
-4. Add the plugin to your `opencode.json`:
-
-```json
-{
-  "plugin": ["opencode-tgbot"]
-}
-```
-
-5. Restart OpenCode. The bot starts polling automatically.
+4. Restart OpenCode. The bot starts polling automatically.
 
 ## What You Can Do
 
@@ -123,6 +131,7 @@ With Upstash configured:
 - Only one instance across all machines polls Telegram (distributed lock)
 - Questions from any machine can be answered via the bot
 - If Upstash is unreachable, falls back to local-only mode
+
 ## Config Reference
 
 Full config at `~/.config/opencode/opencode-notifier.json`:
@@ -155,6 +164,7 @@ Full config at `~/.config/opencode/opencode-notifier.json`:
     "error": "Session encountered an error: {sessionTitle}",
     "question": "Session has a question: {sessionTitle}"
   }
+}
 ```
 
 - `showProjectName` - Include project folder name in notifications (default: true)
